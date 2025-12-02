@@ -1,302 +1,364 @@
 """
-Report Generator - Crypto Portfolio Tracker v3
-===========================================================================
+Report Generator
+================
 
-Servicio para generar reportes del portfolio.
-
-Tipos de reportes:
-- Resumen portfolio
-- Análisis de performance
-- Impuestos (FIFO, LIFO, Average Cost)
-- Posiciones DeFi
-- Riesgos y alertas
-
-Formatos:
-- JSON
-- CSV
-- PDF (opcional)
-
-Author: Crypto Portfolio Tracker Team
-Version: 3.0.0
-License: MIT
+Report generation service for portfolio and tax reports.
 """
 
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from decimal import Decimal
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
 import logging
 import json
-import csv
-from typing import Dict, List, Optional, Any
-from decimal import Decimal
-from datetime import datetime
-from io import StringIO
 
-from src.database import DatabaseManager
-from src.utils import Converters, DateUtils
-
+from src.database.models import (
+    WalletModel, TransactionModel, BalanceModel, TaxRecordModel
+)
 
 logger = logging.getLogger(__name__)
 
 
 class ReportGenerator:
-    """Generador centralizado de reportes."""
-    
-    def __init__(self, db: DatabaseManager):
+    """Report generation service"""
+
+    def __init__(self, db_manager):
         """
-        Inicializa ReportGenerator.
+        Initialize report generator
         
         Args:
-            db: Instancia de DatabaseManager
+            db_manager: DatabaseManager instance
         """
-        self.db = db
-        logger.info("ReportGenerator initialized")
-    
+        self.db_manager = db_manager
+
     def generate_portfolio_summary(self, wallet_id: Optional[int] = None) -> Dict[str, Any]:
         """
-        Genera resumen del portfolio.
+        Generate portfolio summary report
         
         Args:
-            wallet_id: ID de wallet (opcional)
+            wallet_id: Optional wallet filter
             
         Returns:
-            Dict con resumen
+            Portfolio summary report
         """
         try:
-            # Obtener wallets
-            if wallet_id:
-                query = "SELECT * FROM wallets WHERE id = ?"
-                wallet_results = self.db.execute_query(query, (wallet_id,))
-            else:
-                query = "SELECT * FROM wallets"
-                wallet_results = self.db.execute_query(query)
-            
-            wallet_summaries = []
-            total_portfolio_value = Decimal(0)
-            total_tokens = 0
-            
-            for wallet_row in wallet_results:
-                wid = wallet_row[0]
-                address = wallet_row[3]
+            with self.db_manager.session_context() as session:
+                # Get wallets
+                wallet_query = session.query(WalletModel)
+                if wallet_id:
+                    wallet_query = wallet_query.filter_by(id=wallet_id)
                 
-                # Obtener saldos
-                balance_query = """
-                    SELECT 
-                        COUNT(DISTINCT token_symbol) as token_count,
-                        SUM(CAST(balance_usd AS REAL)) as total_usd
-                    FROM balances 
-                    WHERE wallet_id = ?
-                """
-                balance_results = self.db.execute_query(balance_query, (wid,))
+                wallets = wallet_query.all()
                 
-                if balance_results:
-                    token_count = balance_results[0][0] or 0
-                    total_usd = Decimal(balance_results[0][1] or 0)
+                # Get latest balances
+                subquery = session.query(
+                    BalanceModel.wallet_id,
+                    BalanceModel.token_symbol,
+                    func.max(BalanceModel.id).label("max_id")
+                ).group_by(BalanceModel.wallet_id, BalanceModel.token_symbol).subquery()
+                
+                latest_balances = session.query(BalanceModel).join(
+                    subquery,
+                    (BalanceModel.wallet_id == subquery.c.wallet_id) &
+                    (BalanceModel.token_symbol == subquery.c.token_symbol) &
+                    (BalanceModel.id == subquery.c.max_id)
+                ).all()
+                
+                # Calculate portfolio
+                portfolio_by_wallet = {}
+                total_value = Decimal("0")
+                
+                for balance in latest_balances:
+                    if balance.wallet_id not in portfolio_by_wallet:
+                        portfolio_by_wallet[balance.wallet_id] = {
+                            "tokens": {},
+                            "total_usd": Decimal("0")
+                        }
                     
-                    total_portfolio_value += total_usd
-                    total_tokens += token_count
-                    
-                    wallet_summaries.append({
-                        'wallet_id': wid,
-                        'address': Converters.StringUtils.truncate_address(address),
-                        'token_count': token_count,
-                        'total_value_usd': float(total_usd),
-                    })
-            
-            return {
-                'timestamp': datetime.now().isoformat(),
-                'total_portfolio_value_usd': float(total_portfolio_value),
-                'total_tokens': total_tokens,
-                'total_wallets': len(wallet_summaries),
-                'wallets': wallet_summaries,
-            }
-        
+                    balance_usd = balance.balance_usd or Decimal("0")
+                    portfolio_by_wallet[balance.wallet_id]["tokens"][balance.token_symbol] = {
+                        "balance": str(balance.balance),
+                        "balance_usd": str(balance_usd),
+                        "last_update": balance.timestamp.isoformat()
+                    }
+                    portfolio_by_wallet[balance.wallet_id]["total_usd"] += balance_usd
+                    total_value += balance_usd
+                
+                # Count metrics
+                total_wallets = len(wallets)
+                total_transactions = session.query(TransactionModel).count()
+                total_tokens = session.query(func.count(func.distinct(BalanceModel.token_symbol))).scalar()
+                
+                logger.info(f"✅ Portfolio summary generated")
+                
+                return {
+                    "report_type": "portfolio_summary",
+                    "generated_at": datetime.utcnow().isoformat(),
+                    "total_value_usd": str(total_value),
+                    "summary": {
+                        "wallets_count": total_wallets,
+                        "transactions_count": total_transactions,
+                        "unique_tokens": total_tokens or 0
+                    },
+                    "portfolio_by_wallet": {
+                        str(wallet_id): {
+                            "total_usd": str(data["total_usd"]),
+                            "tokens": data["tokens"]
+                        }
+                        for wallet_id, data in portfolio_by_wallet.items()
+                    }
+                }
         except Exception as e:
-            logger.error(f"Error generating portfolio summary: {e}")
-            return {}
-    
+            logger.error(f"❌ Error generating portfolio summary: {str(e)}")
+            raise
+
     def generate_asset_breakdown(self, wallet_id: Optional[int] = None) -> Dict[str, Any]:
         """
-        Genera desglose por activo.
+        Generate asset allocation breakdown report
         
         Args:
-            wallet_id: ID de wallet (opcional)
+            wallet_id: Optional wallet filter
             
         Returns:
-            Dict con desglose
+            Asset breakdown report
         """
         try:
-            if wallet_id:
-                query = """
-                    SELECT 
-                        token_symbol,
-                        network,
-                        COUNT(*) as wallet_count,
-                        SUM(CAST(balance AS REAL)) as total_balance,
-                        SUM(CAST(balance_usd AS REAL)) as total_usd
-                    FROM balances
-                    WHERE wallet_id = ?
-                    GROUP BY token_symbol, network
-                    ORDER BY total_usd DESC
-                """
-                results = self.db.execute_query(query, (wallet_id,))
-            else:
-                query = """
-                    SELECT 
-                        token_symbol,
-                        network,
-                        COUNT(*) as wallet_count,
-                        SUM(CAST(balance AS REAL)) as total_balance,
-                        SUM(CAST(balance_usd AS REAL)) as total_usd
-                    FROM balances
-                    GROUP BY token_symbol, network
-                    ORDER BY total_usd DESC
-                """
-                results = self.db.execute_query(query)
-            
-            # Obtener total para calcular porcentajes
-            total_query = "SELECT SUM(CAST(balance_usd AS REAL)) FROM balances"
-            if wallet_id:
-                total_query += " WHERE wallet_id = ?"
-                total_result = self.db.execute_query(total_query, (wallet_id,))
-            else:
-                total_result = self.db.execute_query(total_query)
-            
-            total_usd = Decimal(total_result[0][0] or 0) if total_result else Decimal(0)
-            
-            assets = []
-            for row in results:
-                value = Decimal(row[4] or 0)
-                percentage = (value / total_usd * 100) if total_usd > 0 else Decimal(0)
+            with self.db_manager.session_context() as session:
+                # Get latest balances
+                subquery = session.query(
+                    BalanceModel.token_symbol,
+                    func.max(BalanceModel.id).label("max_id")
+                )
                 
-                assets.append({
-                    'symbol': row[0],
-                    'network': row[1],
-                    'balance': float(Decimal(row[3] or 0)),
-                    'value_usd': float(value),
-                    'percentage': float(percentage),
-                })
+                if wallet_id:
+                    subquery = subquery.filter_by(wallet_id=wallet_id)
+                
+                subquery = subquery.group_by(BalanceModel.token_symbol).subquery()
+                
+                latest_balances = session.query(BalanceModel).join(
+                    subquery,
+                    (BalanceModel.token_symbol == subquery.c.token_symbol) &
+                    (BalanceModel.id == subquery.c.max_id)
+                ).all()
+                
+                # Calculate breakdown
+                total_usd = Decimal("0")
+                assets = {}
+                
+                for balance in latest_balances:
+                    balance_usd = balance.balance_usd or Decimal("0")
+                    total_usd += balance_usd
+                    assets[balance.token_symbol] = {
+                        "balance": str(balance.balance),
+                        "balance_usd": str(balance_usd)
+                    }
+                
+                # Calculate percentages
+                for token, data in assets.items():
+                    if total_usd > 0:
+                        percentage = (Decimal(data["balance_usd"]) / total_usd) * 100
+                        data["percentage"] = f"{percentage:.2f}%"
+                    else:
+                        data["percentage"] = "0%"
+                
+                logger.info(f"✅ Asset breakdown generated")
+                
+                return {
+                    "report_type": "asset_breakdown",
+                    "generated_at": datetime.utcnow().isoformat(),
+                    "total_value_usd": str(total_usd),
+                    "assets": sorted(
+                        assets.items(),
+                        key=lambda x: float(x["balance_usd"]),
+                        reverse=True
+                    )
+                }
+        except Exception as e:
+            logger.error(f"❌ Error generating asset breakdown: {str(e)}")
+            raise
+
+    def generate_transaction_report(self,
+                                   wallet_id: Optional[int] = None,
+                                   start_date: Optional[datetime] = None,
+                                   end_date: Optional[datetime] = None,
+                                   limit: int = 1000) -> Dict[str, Any]:
+        """
+        Generate transaction activity report
+        
+        Args:
+            wallet_id: Optional wallet filter
+            start_date: Optional start date
+            end_date: Optional end date
+            limit: Maximum transactions to include
+            
+        Returns:
+            Transaction report
+        """
+        try:
+            with self.db_manager.session_context() as session:
+                query = session.query(TransactionModel)
+                
+                if wallet_id:
+                    query = query.filter_by(wallet_id=wallet_id)
+                
+                if start_date:
+                    query = query.filter(TransactionModel.created_at >= start_date)
+                
+                if end_date:
+                    query = query.filter(TransactionModel.created_at <= end_date)
+                
+                transactions = query.order_by(
+                    TransactionModel.created_at.desc()
+                ).limit(limit).all()
+                
+                # Count by type
+                type_counts = {}
+                total_fees = Decimal("0")
+                
+                for tx in transactions:
+                    type_counts[tx.tx_type] = type_counts.get(tx.tx_type, 0) + 1
+                    total_fees += tx.fee
+                
+                logger.info(f"✅ Transaction report generated: {len(transactions)} transactions")
+                
+                return {
+                    "report_type": "transaction_activity",
+                    "generated_at": datetime.utcnow().isoformat(),
+                    "summary": {
+                        "total_transactions": len(transactions),
+                        "by_type": type_counts,
+                        "total_fees": str(total_fees)
+                    },
+                    "transactions": [
+                        {
+                            "id": tx.id,
+                            "tx_hash": tx.tx_hash,
+                            "tx_type": tx.tx_type,
+                            "token_in": tx.token_in,
+                            "token_out": tx.token_out,
+                            "amount_in": str(tx.amount_in) if tx.amount_in else None,
+                            "amount_out": str(tx.amount_out) if tx.amount_out else None,
+                            "fee": str(tx.fee),
+                            "created_at": tx.created_at.isoformat()
+                        }
+                        for tx in transactions
+                    ]
+                }
+        except Exception as e:
+            logger.error(f"❌ Error generating transaction report: {str(e)}")
+            raise
+
+    def generate_tax_report(self,
+                           wallet_id: int,
+                           year: int,
+                           tax_method: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Generate tax calculation report
+        
+        Args:
+            wallet_id: Wallet ID
+            year: Tax year
+            tax_method: Optional filter by method ('FIFO', 'LIFO', 'AVERAGE_COST')
+            
+        Returns:
+            Tax report
+        """
+        try:
+            with self.db_manager.session_context() as session:
+                query = session.query(TaxRecordModel).filter(
+                    TaxRecordModel.wallet_id == wallet_id,
+                    TaxRecordModel.year == year
+                )
+                
+                if tax_method:
+                    query = query.filter_by(tax_method=tax_method)
+                
+                tax_records = query.all()
+                
+                # Summarize
+                total_gain_loss = Decimal("0")
+                total_cost_basis = Decimal("0")
+                total_proceeds = Decimal("0")
+                
+                by_method = {}
+                
+                for record in tax_records:
+                    total_gain_loss += record.gain_loss
+                    total_cost_basis += record.cost_basis
+                    total_proceeds += record.proceeds
+                    
+                    method = record.tax_method
+                    if method not in by_method:
+                        by_method[method] = {
+                            "count": 0,
+                            "gain_loss": Decimal("0"),
+                            "cost_basis": Decimal("0"),
+                            "proceeds": Decimal("0")
+                        }
+                    
+                    by_method[method]["count"] += 1
+                    by_method[method]["gain_loss"] += record.gain_loss
+                    by_method[method]["cost_basis"] += record.cost_basis
+                    by_method[method]["proceeds"] += record.proceeds
+                
+                # US federal tax rate (can be parameterized)
+                tax_rate = Decimal("0.21")  # Long-term capital gains
+                estimated_tax = total_gain_loss * tax_rate
+                
+                logger.info(f"✅ Tax report generated for {year}")
+                
+                return {
+                    "report_type": "tax_calculation",
+                    "generated_at": datetime.utcnow().isoformat(),
+                    "wallet_id": wallet_id,
+                    "year": year,
+                    "summary": {
+                        "total_transactions": len(tax_records),
+                        "total_gain_loss": str(total_gain_loss),
+                        "total_cost_basis": str(total_cost_basis),
+                        "total_proceeds": str(total_proceeds),
+                        "estimated_tax_rate": f"{float(tax_rate * 100)}%",
+                        "estimated_tax_usd": str(estimated_tax)
+                    },
+                    "by_method": {
+                        method: {
+                            "transaction_count": data["count"],
+                            "gain_loss": str(data["gain_loss"]),
+                            "cost_basis": str(data["cost_basis"]),
+                            "proceeds": str(data["proceeds"])
+                        }
+                        for method, data in by_method.items()
+                    }
+                }
+        except Exception as e:
+            logger.error(f"❌ Error generating tax report: {str(e)}")
+            raise
+
+    def generate_comprehensive_report(self, wallet_id: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Generate comprehensive report with all data
+        
+        Args:
+            wallet_id: Optional wallet filter
+            
+        Returns:
+            Comprehensive report
+        """
+        try:
+            portfolio = self.generate_portfolio_summary(wallet_id)
+            breakdown = self.generate_asset_breakdown(wallet_id)
+            transactions = self.generate_transaction_report(wallet_id)
             
             return {
-                'timestamp': datetime.now().isoformat(),
-                'total_portfolio_usd': float(total_usd),
-                'assets': assets,
+                "report_type": "comprehensive",
+                "generated_at": datetime.utcnow().isoformat(),
+                "sections": {
+                    "portfolio_summary": portfolio,
+                    "asset_breakdown": breakdown,
+                    "transaction_activity": transactions
+                }
             }
-        
         except Exception as e:
-            logger.error(f"Error generating asset breakdown: {e}")
-            return {}
-    
-    def generate_transaction_report(self, wallet_id: int, start_date: Optional[datetime] = None,
-                                   end_date: Optional[datetime] = None) -> Dict[str, Any]:
-        """
-        Genera reporte de transacciones.
-        
-        Args:
-            wallet_id: ID de la wallet
-            start_date: Fecha inicial (opcional)
-            end_date: Fecha final (opcional)
-            
-        Returns:
-            Dict con transacciones
-        """
-        try:
-            query = "SELECT * FROM transactions WHERE wallet_id = ?"
-            params = [wallet_id]
-            
-            if start_date:
-                query += " AND timestamp >= ?"
-                params.append(start_date)
-            
-            if end_date:
-                query += " AND timestamp <= ?"
-                params.append(end_date)
-            
-            query += " ORDER BY timestamp DESC"
-            
-            results = self.db.execute_query(query, tuple(params))
-            
-            transactions = []
-            total_volume = Decimal(0)
-            
-            for row in results:
-                value = Decimal(row[11] or 0)
-                total_volume += value
-                
-                transactions.append({
-                    'timestamp': row[13],
-                    'type': row[3],
-                    'token_in': row[4],
-                    'token_out': row[5],
-                    'amount_in': float(Decimal(row[6] or 0)),
-                    'amount_out': float(Decimal(row[7] or 0)),
-                    'fee': float(Decimal(row[8] or 0)),
-                    'value_usd': float(value),
-                })
-            
-            return {
-                'wallet_id': wallet_id,
-                'start_date': start_date.isoformat() if start_date else None,
-                'end_date': end_date.isoformat() if end_date else None,
-                'total_transactions': len(transactions),
-                'total_volume_usd': float(total_volume),
-                'transactions': transactions,
-            }
-        
-        except Exception as e:
-            logger.error(f"Error generating transaction report: {e}")
-            return {}
-    
-    def export_to_json(self, data: Dict[str, Any]) -> str:
-        """
-        Exporta datos a JSON.
-        
-        Args:
-            data: Dict con datos
-            
-        Returns:
-            String JSON
-        """
-        try:
-            return json.dumps(data, indent=2, default=str)
-        except Exception as e:
-            logger.error(f"Error exporting to JSON: {e}")
-            return "{}"
-    
-    def export_to_csv(self, data: Dict[str, Any], report_type: str = "portfolio") -> str:
-        """
-        Exporta datos a CSV.
-        
-        Args:
-            data: Dict con datos
-            report_type: Tipo de reporte
-            
-        Returns:
-            String CSV
-        """
-        try:
-            output = StringIO()
-            
-            if report_type == "portfolio":
-                writer = csv.DictWriter(output, fieldnames=['wallet_id', 'address', 'token_count', 'total_value_usd'])
-                writer.writeheader()
-                for wallet in data.get('wallets', []):
-                    writer.writerow(wallet)
-            
-            elif report_type == "assets":
-                writer = csv.DictWriter(output, fieldnames=['symbol', 'network', 'balance', 'value_usd', 'percentage'])
-                writer.writeheader()
-                for asset in data.get('assets', []):
-                    writer.writerow(asset)
-            
-            elif report_type == "transactions":
-                writer = csv.DictWriter(output, fieldnames=['timestamp', 'type', 'token_in', 'token_out', 'amount_in', 'amount_out', 'fee', 'value_usd'])
-                writer.writeheader()
-                for tx in data.get('transactions', []):
-                    writer.writerow(tx)
-            
-            return output.getvalue()
-        
-        except Exception as e:
-            logger.error(f"Error exporting to CSV: {e}")
-            return ""
-
-
-__all__ = ["ReportGenerator"]
+            logger.error(f"❌ Error generating comprehensive report: {str(e)}")
+            raise
