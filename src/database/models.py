@@ -10,7 +10,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from decimal import Decimal
-import enum
+from enum import Enum as PyEnum
 
 Base = declarative_base()
 
@@ -122,3 +122,74 @@ class TaxRecordModel(Base):
 
     def __repr__(self):
         return f"<TaxRecord {self.year} gain={self.gain_loss}>"
+
+class BlockchainNetwork(PyEnum):
+    ETHEREUM = "ethereum"
+    ARBITRUM = "arbitrum"
+    BASE = "base"
+    POLYGON = "polygon"
+    BITCOIN = "bitcoin"
+    SOLANA = "solana"
+
+class WalletType(PyEnum):
+    METAMASK = "metamask"
+    PHANTOM = "phantom"
+    LEDGER = "ledger"
+    EXCHANGE = "exchange"
+    SELF_CUSTODY = "self_custody"
+
+class ExchangeAccount(Base):
+    """Exchange account model"""
+    __tablename__ = "exchange_accounts"
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    exchange = Column(String(50), nullable=False)  # binance, coinbase, kraken
+    api_key_encrypted = Column(String(500), nullable=False)
+    api_secret_encrypted = Column(String(500), nullable=False)
+    label = Column(String(100))
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class BlockchainWallet(Base):
+    """Blockchain wallet model"""
+    __tablename__ = "blockchain_wallets"
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    address = Column(String(500), nullable=False)
+    network = Column(String(50), nullable=False)  # ethereum, bitcoin, solana, etc
+    wallet_type = Column(String(50), nullable=False)  # metamask, phantom, ledger
+    label = Column(String(100))
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    balances = relationship("WalletBalance", back_populates="wallet", cascade="all, delete-orphan")
+
+class WalletBalance(Base):
+    """Wallet balance snapshot"""
+    __tablename__ = "wallet_balances"
+    
+    id = Column(Integer, primary_key=True)
+    wallet_id = Column(Integer, ForeignKey("blockchain_wallets.id", ondelete="CASCADE"))
+    token = Column(String(100), nullable=False)
+    balance = Column(String(100), nullable=False)  # Use String for Decimal
+    balance_usd = Column(String(100))
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+class DeFiPosition(Base):
+    """DeFi protocol position"""
+    __tablename__ = "defi_positions"
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    address = Column(String(500), nullable=False)
+    protocol = Column(String(50), nullable=False)  # uniswap, aave, etc
+    position_type = Column(String(50), nullable=False)  # liquidity, lending, borrowing
+    token0 = Column(String(100))
+    token1 = Column(String(100))
+    balance0 = Column(String(100))
+    balance1 = Column(String(100))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
