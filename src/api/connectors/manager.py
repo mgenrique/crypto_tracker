@@ -10,6 +10,8 @@ Orchestrates all connector instances.
 import logging
 from typing import Dict, List, Optional, Any
 from enum import Enum
+from src.api.connectors.tokens.bridged_token_detector import BridgedTokenDetector
+from src.api.connectors.tokens.wrapped_token_detector import WrappedTokenDetector
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,8 @@ class ConnectorManager:
     def __init__(self):
         """Initialize connector manager"""
         self.connectors = {}
+        self.bridged_detector = BridgedTokenDetector()
+        self.wrapped_detector = WrappedTokenDetector()
         self.logger = logging.getLogger("connector.manager")
     
     def register_exchange(self, name: str, connector):
@@ -68,3 +72,40 @@ class ConnectorManager:
                 self.logger.error(f"Error getting balance from {key}: {str(e)}")
         
         return all_balances
+    
+    async def analyze_tokens(self, balances: Dict[str, Any], network: str) -> Dict[str, Any]:
+        """
+        Analyze balances for bridged and wrapped tokens
+        
+        Args:
+            balances: Token balances
+            network: Network name
+        
+        Returns:
+            Analysis with categorized tokens
+        """
+        try:
+            analysis = {
+                "canonical": {},
+                "bridged": {},
+                "wrapped": {},
+                "other": balances
+            }
+            
+            # Detect bridged tokens
+            bridged = await self.bridged_detector.detect_all_bridged_tokens(balances, network)
+            analysis["bridged"] = bridged
+            
+            # Detect wrapped tokens
+            wrapped = await self.wrapped_detector.detect_all_wrapped_tokens(balances, network)
+            analysis["wrapped"] = wrapped
+            
+            # Remove detected tokens from "other"
+            for addr in list(bridged.keys()) + list(wrapped.keys()):
+                analysis["other"].pop(addr, None)
+            
+            self.logger.info(f"✅ Token analysis complete")
+            return analysis
+        except Exception as e:
+            self.logger.error(f"❌ Error analyzing tokens: {str(e)}")
+            return {"error": str(e)}        
