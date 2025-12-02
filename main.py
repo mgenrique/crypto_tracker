@@ -71,6 +71,13 @@ from src.api.v1.routes import router as v1_router
 # Include API routes
 app.include_router(v1_router)
 
+from src.api.v1.auth_routes import router as auth_router
+
+# Include routers
+app.include_router(v1_router)
+app.include_router(auth_router)
+
+
 # OpenAPI documentation
 @app.get("/", include_in_schema=False)
 async def redirect_to_docs():
