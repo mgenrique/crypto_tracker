@@ -1,0 +1,52 @@
+# Core Dependencies
+pydantic>=2.0              # Validación de datos y configuración
+pyyaml>=6.0                # Parseo de archivos YAML
+python-dotenv>=0.21        # Carga de variables de entorno
+
+# Database
+sqlalchemy>=2.0            # ORM y query builder
+alembic>=1.12              # Migraciones de BD
+
+# Blockchain & Web3
+web3.py>=6.0               # Conexión con blockchain Ethereum
+eth-account>=0.9           # Manejo de cuentas Ethereum
+eth-typing>=3.0            # Tipos de datos Ethereum
+eth-keys>=0.4              # Gestión de claves Ethereum
+eth-utils>=2.0             # Utilidades Ethereum
+
+# APIs & HTTP
+requests>=2.28             # Requests HTTP
+aiohttp>=3.8               # HTTP asincrónico
+websockets>=10.0           # WebSocket support
+httpx>=0.23                # HTTP client moderno
+
+# Data Processing
+pandas>=1.5                # DataFrames y análisis
+numpy>=1.23                # Computación numérica
+python-dateutil>=2.8       # Utilidades de fecha
+pytz>=2023.3               # Timezone support
+
+# Cryptography
+cryptography>=40.0         # Librerías de criptografía
+pycryptodome>=3.17         # Librerías criptográficas adicionales
+
+# Utilities
+python-dateutil>=2.8       # Parsing de fechas
+pytz>=2023.3               # Timezones
+
+# Development & Testing
+pytest>=7.0                # Testing framework
+pytest-asyncio>=0.21       # Async testing
+pytest-cov>=4.0            # Coverage reporting
+black>=22.0                # Code formatter
+flake8>=4.0                # Linter
+isort>=5.12                # Import sorting
+mypy>=0.990                # Type checking
+pylint>=2.16               # Code analysis
+
+# Documentation
+sphinx>=5.0                # Documentación
+sphinx-rtd-theme>=1.2      # Tema RTD para Sphinx
+
+# Monitoring & Logging
+python-json-logger>=2.0    # JSON logging
