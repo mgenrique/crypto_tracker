@@ -65,6 +65,20 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+from src.api.v1.routes import router as v1_router
+
+# Include API routes
+app.include_router(v1_router)
+
+# OpenAPI documentation
+@app.get("/", include_in_schema=False)
+async def redirect_to_docs():
+    """Redirect to API docs"""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/docs")
+
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
