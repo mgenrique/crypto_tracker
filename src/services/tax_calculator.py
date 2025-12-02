@@ -1,246 +1,393 @@
 """
-Tax Calculator - Crypto Portfolio Tracker v3
-===========================================================================
+Tax Calculator
+==============
 
-Servicio para cálculos de impuestos sobre criptomonedas.
-
-Soporta:
-- FIFO (First In First Out)
-- LIFO (Last In First Out)
-- Average Cost
-- Ganancia/Pérdida realizada
-- Reportes de impuestos
-
-Nota: Consulta con asesor fiscal local. Este código es educativo.
-
-Author: Crypto Portfolio Tracker Team
-Version: 3.0.0
-License: MIT
+Tax calculation service with multiple methods.
+Implements FIFO, LIFO, and Average Cost methods.
 """
 
-import logging
-from typing import Dict, List, Optional, Tuple
+from sqlalchemy.orm import Session
 from decimal import Decimal
 from datetime import datetime
-from enum import Enum
+from typing import List, Dict, Any, Tuple
+import logging
 
-from src.database import DatabaseManager, Transaction, TransactionType
-from src.utils import Converters
-
+from src.database.models import (
+    TransactionModel, TaxRecordModel, WalletModel
+)
 
 logger = logging.getLogger(__name__)
 
 
-class CostBasisMethod(Enum):
-    """Métodos para calcular cost basis."""
-    FIFO = "fifo"           # First In First Out
-    LIFO = "lifo"           # Last In Last Out
-    AVERAGE_COST = "average"  # Costo promedio
-
-
 class TaxCalculator:
-    """Calculador de impuestos para criptomonedas."""
-    
-    def __init__(self, db: DatabaseManager, cost_basis_method: CostBasisMethod = CostBasisMethod.FIFO):
+    """Tax calculation service"""
+
+    def __init__(self, db_manager):
         """
-        Inicializa TaxCalculator.
+        Initialize tax calculator
         
         Args:
-            db: Instancia de DatabaseManager
-            cost_basis_method: Método para calcular cost basis
+            db_manager: DatabaseManager instance
         """
-        self.db = db
-        self.cost_basis_method = cost_basis_method
-        logger.info(f"TaxCalculator initialized with {cost_basis_method.value} method")
-    
-    def get_transaction_history(self, wallet_id: int, token_symbol: str) -> List[Dict]:
+        self.db_manager = db_manager
+
+    def calculate_fifo(self, wallet_id: int, year: int, token: Optional[str] = None) -> Dict[str, Any]:
         """
-        Obtiene histórico de transacciones para un token.
+        Calculate taxes using FIFO (First In, First Out) method
         
         Args:
-            wallet_id: ID de la wallet
-            token_symbol: Símbolo del token
+            wallet_id: Wallet ID
+            year: Tax year
+            token: Optional token filter (e.g., 'ETH')
             
         Returns:
-            Lista de transacciones ordenadas por timestamp
+            Tax calculation results
         """
         try:
-            query = """
-                SELECT * FROM transactions 
-                WHERE wallet_id = ? AND (token_in_symbol = ? OR token_out_symbol = ?)
-                ORDER BY timestamp ASC
-            """
-            results = self.db.execute_query(query, (wallet_id, token_symbol, token_symbol))
-            
-            transactions = []
-            for row in results:
-                transactions.append({
-                    'id': row[0],
-                    'type': row[3],
-                    'token_in': row[4],
-                    'token_out': row[5],
-                    'amount_in': Decimal(row[6] or 0),
-                    'amount_out': Decimal(row[7] or 0),
-                    'fee': Decimal(row[8] or 0),
-                    'price_per_unit': Decimal(row[10] or 0),
-                    'value_usd': Decimal(row[11] or 0),
-                    'timestamp': row[13],
-                })
-            
-            return transactions
-        
-        except Exception as e:
-            logger.error(f"Error getting transaction history: {e}")
-            return []
-    
-    def calculate_fifo_gain_loss(self, wallet_id: int, token_symbol: str) -> Dict[str, Decimal]:
-        """
-        Calcula ganancia/pérdida usando FIFO.
-        
-        Args:
-            wallet_id: ID de la wallet
-            token_symbol: Símbolo del token
-            
-        Returns:
-            Dict con ganancias/pérdidas
-        """
-        try:
-            transactions = self.get_transaction_history(wallet_id, token_symbol)
-            
-            fifo_queue = []  # (cantidad, cost_per_unit, timestamp)
-            realized_gains = Decimal(0)
-            realized_losses = Decimal(0)
-            
-            for tx in transactions:
-                if tx['token_in'] == token_symbol:
-                    # Compra
-                    cost_per_unit = tx['value_usd'] / tx['amount_in'] if tx['amount_in'] > 0 else Decimal(0)
-                    fifo_queue.append((tx['amount_in'], cost_per_unit, tx['timestamp']))
+            with self.db_manager.session_context() as session:
+                # Get all BUY transactions ordered by date (FIFO = oldest first)
+                buy_query = session.query(TransactionModel).filter(
+                    TransactionModel.wallet_id == wallet_id,
+                    TransactionModel.tx_type.in_(["buy", "transfer_in"]),
+                    TransactionModel.created_at.year == year
+                ).order_by(TransactionModel.created_at.asc())
                 
-                elif tx['token_out'] == token_symbol:
-                    # Venta/salida
-                    amount_to_sell = tx['amount_out']
-                    sale_price_per_unit = tx['value_usd'] / tx['amount_out'] if tx['amount_out'] > 0 else Decimal(0)
+                if token:
+                    buy_query = buy_query.filter_by(token_out=token)
+                
+                buy_transactions = buy_query.all()
+                
+                # Get all SELL transactions
+                sell_query = session.query(TransactionModel).filter(
+                    TransactionModel.wallet_id == wallet_id,
+                    TransactionModel.tx_type.in_(["sell", "swap", "transfer_out"]),
+                    TransactionModel.created_at.year == year
+                ).order_by(TransactionModel.created_at.asc())
+                
+                if token:
+                    sell_query = sell_query.filter(
+                        (TransactionModel.token_in == token) | (TransactionModel.token_out == token)
+                    )
+                
+                sell_transactions = sell_query.all()
+                
+                # Calculate gains/losses
+                total_gain_loss = Decimal("0")
+                total_cost_basis = Decimal("0")
+                total_proceeds = Decimal("0")
+                tax_records = []
+                
+                cost_basis_per_unit = Decimal("0")
+                remaining_buy_amount = Decimal("0")
+                buy_index = 0
+                
+                for sell_tx in sell_transactions:
+                    remaining_to_sell = sell_tx.amount_in if sell_tx.amount_in else Decimal("0")
                     
-                    while amount_to_sell > 0 and fifo_queue:
-                        qty, cost, ts = fifo_queue.pop(0)
+                    while remaining_to_sell > 0 and buy_index < len(buy_transactions):
+                        buy_tx = buy_transactions[buy_index]
+                        available_to_sell = (buy_tx.amount_out or Decimal("0")) - remaining_buy_amount
                         
-                        if qty <= amount_to_sell:
-                            # Vender todo este lote
-                            gain = (sale_price_per_unit - cost) * qty
-                            if gain > 0:
-                                realized_gains += gain
-                            else:
-                                realized_losses += abs(gain)
-                            amount_to_sell -= qty
-                        else:
-                            # Vender parte del lote
-                            gain = (sale_price_per_unit - cost) * amount_to_sell
-                            if gain > 0:
-                                realized_gains += gain
-                            else:
-                                realized_losses += abs(gain)
-                            # Retornar el resto del lote
-                            fifo_queue.insert(0, (qty - amount_to_sell, cost, ts))
-                            amount_to_sell = Decimal(0)
-            
-            return {
-                'realized_gains': realized_gains,
-                'realized_losses': realized_losses,
-                'net_gain_loss': realized_gains - realized_losses,
-                'method': 'FIFO',
-            }
-        
-        except Exception as e:
-            logger.error(f"Error calculating FIFO gain/loss: {e}")
-            return {}
-    
-    def calculate_average_cost_gain_loss(self, wallet_id: int, token_symbol: str) -> Dict[str, Decimal]:
-        """
-        Calcula ganancia/pérdida usando costo promedio.
-        
-        Args:
-            wallet_id: ID de la wallet
-            token_symbol: Símbolo del token
-            
-        Returns:
-            Dict con ganancias/pérdidas
-        """
-        try:
-            transactions = self.get_transaction_history(wallet_id, token_symbol)
-            
-            total_quantity = Decimal(0)
-            total_cost = Decimal(0)
-            realized_gains = Decimal(0)
-            realized_losses = Decimal(0)
-            
-            for tx in transactions:
-                if tx['token_in'] == token_symbol:
-                    # Compra
-                    total_cost += tx['value_usd']
-                    total_quantity += tx['amount_in']
+                        if available_to_sell <= 0:
+                            buy_index += 1
+                            remaining_buy_amount = Decimal("0")
+                            continue
+                        
+                        sell_amount = min(remaining_to_sell, available_to_sell)
+                        cost_basis = sell_amount * (buy_tx.price_usd_in or Decimal("0"))
+                        proceeds = sell_amount * (sell_tx.price_usd_out or Decimal("0"))
+                        gain_loss = proceeds - cost_basis
+                        
+                        total_gain_loss += gain_loss
+                        total_cost_basis += cost_basis
+                        total_proceeds += proceeds
+                        
+                        # Create tax record
+                        tax_record = TaxRecordModel(
+                            wallet_id=wallet_id,
+                            transaction_id=sell_tx.id,
+                            gain_loss=gain_loss,
+                            cost_basis=cost_basis,
+                            proceeds=proceeds,
+                            tax_method="FIFO",
+                            year=year
+                        )
+                        session.add(tax_record)
+                        
+                        remaining_to_sell -= sell_amount
+                        remaining_buy_amount += sell_amount
+                    
+                    if remaining_to_sell > 0:
+                        logger.warning(f"⚠️  Insufficient cost basis for FIFO calculation on {sell_tx.tx_hash}")
                 
-                elif tx['token_out'] == token_symbol:
-                    # Venta
-                    if total_quantity > 0:
-                        average_cost = total_cost / total_quantity
-                        sale_price_per_unit = tx['value_usd'] / tx['amount_out'] if tx['amount_out'] > 0 else Decimal(0)
-                        
-                        gain = (sale_price_per_unit - average_cost) * tx['amount_out']
-                        if gain > 0:
-                            realized_gains += gain
-                        else:
-                            realized_losses += abs(gain)
-                        
-                        # Ajustar totales
-                        total_cost = total_cost * (total_quantity - tx['amount_out']) / total_quantity
-                        total_quantity -= tx['amount_out']
-            
-            return {
-                'realized_gains': realized_gains,
-                'realized_losses': realized_losses,
-                'net_gain_loss': realized_gains - realized_losses,
-                'method': 'AVERAGE_COST',
-                'unrealized_cost': total_cost,
-                'unrealized_quantity': total_quantity,
-            }
-        
+                session.flush()
+                
+                logger.info(f"✅ FIFO tax calculated: gain/loss={total_gain_loss}")
+                
+                return {
+                    "method": "FIFO",
+                    "year": year,
+                    "total_gain_loss": str(total_gain_loss),
+                    "total_cost_basis": str(total_cost_basis),
+                    "total_proceeds": str(total_proceeds),
+                    "tax_records_count": len(tax_records),
+                    "estimated_tax_usd": str(total_gain_loss * Decimal("0.21"))  # Typical rate
+                }
         except Exception as e:
-            logger.error(f"Error calculating average cost gain/loss: {e}")
-            return {}
-    
-    def get_annual_summary(self, wallet_id: int, year: int) -> Dict[str, Decimal]:
+            logger.error(f"❌ Error calculating FIFO: {str(e)}")
+            raise
+
+    def calculate_lifo(self, wallet_id: int, year: int, token: Optional[str] = None) -> Dict[str, Any]:
         """
-        Obtiene resumen de impuestos del año.
+        Calculate taxes using LIFO (Last In, First Out) method
         
         Args:
-            wallet_id: ID de la wallet
-            year: Año fiscal
+            wallet_id: Wallet ID
+            year: Tax year
+            token: Optional token filter
             
         Returns:
-            Dict con totales del año
+            Tax calculation results
         """
         try:
-            query = """
-                SELECT token_in_symbol, token_out_symbol, 
-                       SUM(CAST(value_usd AS REAL)) as total_value
-                FROM transactions 
-                WHERE wallet_id = ? AND strftime('%Y', timestamp) = ?
-                GROUP BY CASE WHEN token_in_symbol IS NOT NULL THEN token_in_symbol ELSE token_out_symbol END
-            """
-            
-            results = self.db.execute_query(query, (wallet_id, str(year)))
-            
-            summary = {}
-            for row in results:
-                token = row[0] or row[1]
-                summary[token] = Decimal(row[2] or 0)
-            
-            return summary
-        
+            with self.db_manager.session_context() as session:
+                # Get all BUY transactions ordered by date (LIFO = newest first)
+                buy_query = session.query(TransactionModel).filter(
+                    TransactionModel.wallet_id == wallet_id,
+                    TransactionModel.tx_type.in_(["buy", "transfer_in"]),
+                    TransactionModel.created_at.year == year
+                ).order_by(TransactionModel.created_at.desc())
+                
+                if token:
+                    buy_query = buy_query.filter_by(token_out=token)
+                
+                buy_transactions = buy_query.all()
+                
+                # Get all SELL transactions
+                sell_query = session.query(TransactionModel).filter(
+                    TransactionModel.wallet_id == wallet_id,
+                    TransactionModel.tx_type.in_(["sell", "swap", "transfer_out"]),
+                    TransactionModel.created_at.year == year
+                ).order_by(TransactionModel.created_at.asc())
+                
+                if token:
+                    sell_query = sell_query.filter(
+                        (TransactionModel.token_in == token) | (TransactionModel.token_out == token)
+                    )
+                
+                sell_transactions = sell_query.all()
+                
+                total_gain_loss = Decimal("0")
+                total_cost_basis = Decimal("0")
+                total_proceeds = Decimal("0")
+                
+                buy_index = 0
+                remaining_buy_amount = Decimal("0")
+                
+                for sell_tx in sell_transactions:
+                    remaining_to_sell = sell_tx.amount_in if sell_tx.amount_in else Decimal("0")
+                    
+                    while remaining_to_sell > 0 and buy_index < len(buy_transactions):
+                        buy_tx = buy_transactions[buy_index]
+                        available_to_sell = (buy_tx.amount_out or Decimal("0")) - remaining_buy_amount
+                        
+                        if available_to_sell <= 0:
+                            buy_index += 1
+                            remaining_buy_amount = Decimal("0")
+                            continue
+                        
+                        sell_amount = min(remaining_to_sell, available_to_sell)
+                        cost_basis = sell_amount * (buy_tx.price_usd_in or Decimal("0"))
+                        proceeds = sell_amount * (sell_tx.price_usd_out or Decimal("0"))
+                        gain_loss = proceeds - cost_basis
+                        
+                        total_gain_loss += gain_loss
+                        total_cost_basis += cost_basis
+                        total_proceeds += proceeds
+                        
+                        # Create tax record
+                        tax_record = TaxRecordModel(
+                            wallet_id=wallet_id,
+                            transaction_id=sell_tx.id,
+                            gain_loss=gain_loss,
+                            cost_basis=cost_basis,
+                            proceeds=proceeds,
+                            tax_method="LIFO",
+                            year=year
+                        )
+                        session.add(tax_record)
+                        
+                        remaining_to_sell -= sell_amount
+                        remaining_buy_amount += sell_amount
+                
+                session.flush()
+                
+                logger.info(f"✅ LIFO tax calculated: gain/loss={total_gain_loss}")
+                
+                return {
+                    "method": "LIFO",
+                    "year": year,
+                    "total_gain_loss": str(total_gain_loss),
+                    "total_cost_basis": str(total_cost_basis),
+                    "total_proceeds": str(total_proceeds),
+                    "estimated_tax_usd": str(total_gain_loss * Decimal("0.21"))
+                }
         except Exception as e:
-            logger.error(f"Error getting annual summary: {e}")
-            return {}
+            logger.error(f"❌ Error calculating LIFO: {str(e)}")
+            raise
 
+    def calculate_average_cost(self, wallet_id: int, year: int, token: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Calculate taxes using Average Cost method
+        
+        Args:
+            wallet_id: Wallet ID
+            year: Tax year
+            token: Optional token filter
+            
+        Returns:
+            Tax calculation results
+        """
+        try:
+            with self.db_manager.session_context() as session:
+                # Get all transactions for the year
+                buy_query = session.query(TransactionModel).filter(
+                    TransactionModel.wallet_id == wallet_id,
+                    TransactionModel.tx_type.in_(["buy", "transfer_in"]),
+                    TransactionModel.created_at.year == year
+                )
+                
+                if token:
+                    buy_query = buy_query.filter_by(token_out=token)
+                
+                buy_transactions = buy_query.all()
+                
+                sell_query = session.query(TransactionModel).filter(
+                    TransactionModel.wallet_id == wallet_id,
+                    TransactionModel.tx_type.in_(["sell", "swap", "transfer_out"]),
+                    TransactionModel.created_at.year == year
+                )
+                
+                if token:
+                    sell_query = sell_query.filter(
+                        (TransactionModel.token_in == token) | (TransactionModel.token_out == token)
+                    )
+                
+                sell_transactions = sell_query.all()
+                
+                # Calculate average cost basis
+                total_bought = Decimal("0")
+                total_cost = Decimal("0")
+                
+                for buy_tx in buy_transactions:
+                    amount = buy_tx.amount_out or Decimal("0")
+                    price = buy_tx.price_usd_in or Decimal("0")
+                    total_bought += amount
+                    total_cost += amount * price
+                
+                average_cost_per_unit = total_cost / total_bought if total_bought > 0 else Decimal("0")
+                
+                # Calculate sells at average cost
+                total_gain_loss = Decimal("0")
+                total_cost_basis = Decimal("0")
+                total_proceeds = Decimal("0")
+                
+                for sell_tx in sell_transactions:
+                    amount = sell_tx.amount_in or Decimal("0")
+                    price = sell_tx.price_usd_out or Decimal("0")
+                    
+                    cost_basis = amount * average_cost_per_unit
+                    proceeds = amount * price
+                    gain_loss = proceeds - cost_basis
+                    
+                    total_gain_loss += gain_loss
+                    total_cost_basis += cost_basis
+                    total_proceeds += proceeds
+                    
+                    # Create tax record
+                    tax_record = TaxRecordModel(
+                        wallet_id=wallet_id,
+                        transaction_id=sell_tx.id,
+                        gain_loss=gain_loss,
+                        cost_basis=cost_basis,
+                        proceeds=proceeds,
+                        tax_method="AVERAGE_COST",
+                        year=year
+                    )
+                    session.add(tax_record)
+                
+                session.flush()
+                
+                logger.info(f"✅ Average cost tax calculated: gain/loss={total_gain_loss}")
+                
+                return {
+                    "method": "AVERAGE_COST",
+                    "year": year,
+                    "average_cost_per_unit": str(average_cost_per_unit),
+                    "total_gain_loss": str(total_gain_loss),
+                    "total_cost_basis": str(total_cost_basis),
+                    "total_proceeds": str(total_proceeds),
+                    "estimated_tax_usd": str(total_gain_loss * Decimal("0.21"))
+                }
+        except Exception as e:
+            logger.error(f"❌ Error calculating average cost: {str(e)}")
+            raise
 
-__all__ = ["TaxCalculator", "CostBasisMethod"]
+    def get_annual_summary(self, wallet_id: int, year: int) -> Dict[str, Any]:
+        """
+        Get annual tax summary for wallet
+        
+        Args:
+            wallet_id: Wallet ID
+            year: Tax year
+            
+        Returns:
+            Annual tax summary
+        """
+        try:
+            with self.db_manager.session_context() as session:
+                # Get all tax records for the year
+                tax_records = session.query(TaxRecordModel).filter(
+                    TaxRecordModel.wallet_id == wallet_id,
+                    TaxRecordModel.year == year
+                ).all()
+                
+                # Group by method
+                by_method = {}
+                total_gain_loss = Decimal("0")
+                
+                for record in tax_records:
+                    method = record.tax_method
+                    if method not in by_method:
+                        by_method[method] = {
+                            "total_gain_loss": Decimal("0"),
+                            "total_cost_basis": Decimal("0"),
+                            "total_proceeds": Decimal("0"),
+                            "records_count": 0
+                        }
+                    
+                    by_method[method]["total_gain_loss"] += record.gain_loss
+                    by_method[method]["total_cost_basis"] += record.cost_basis
+                    by_method[method]["total_proceeds"] += record.proceeds
+                    by_method[method]["records_count"] += 1
+                    total_gain_loss += record.gain_loss
+                
+                return {
+                    "wallet_id": wallet_id,
+                    "year": year,
+                    "total_gain_loss": str(total_gain_loss),
+                    "by_method": {
+                        method: {
+                            "total_gain_loss": str(data["total_gain_loss"]),
+                            "total_cost_basis": str(data["total_cost_basis"]),
+                            "total_proceeds": str(data["total_proceeds"]),
+                            "records_count": data["records_count"]
+                        }
+                        for method, data in by_method.items()
+                    },
+                    "estimated_tax_usd": str(total_gain_loss * Decimal("0.21")),
+                    "generated_at": datetime.utcnow().isoformat()
+                }
+        except Exception as e:
+            logger.error(f"❌ Error getting annual summary: {str(e)}")
+            raise
